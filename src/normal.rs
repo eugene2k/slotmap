@@ -19,9 +19,9 @@ union SlotUnion<T: Slottable> {
     next_free: u32,
 }
 
-// A slot, which represents storage for a value and a current version.
-// Can be occupied or vacant.
-struct Slot<T: Slottable> {
+/// A slot, which represents storage for a value and a current version.
+/// Can be occupied or vacant.
+pub struct Slot<T: Slottable> {
     u: SlotUnion<T>,
     version: u32, // Even = vacant, odd = occupied.
 }
@@ -32,22 +32,36 @@ enum SlotContent<'a, T: 'a + Slottable> {
     Vacant(&'a u32),
 }
 
-enum SlotContentMut<'a, T: 'a + Slottable> {
-    OccupiedMut(&'a mut T),
-    VacantMut(&'a mut u32),
-}
-
 use self::SlotContent::{Occupied, Vacant};
-use self::SlotContentMut::{OccupiedMut, VacantMut};
 
 impl<T: Slottable> Slot<T> {
-    // Is this slot occupied?
+    /// Returns true if the slot is occupied
     #[inline(always)]
     pub fn occupied(&self) -> bool {
         self.version % 2 > 0
     }
 
-    pub fn get(&self) -> SlotContent<T> {
+    /// If the slot is occupied returns a shared reference to its contents
+    /// otherwise returns None
+    pub fn get(&self) -> Option<&T> {
+        if self.occupied() {
+            unsafe { Some(&self.u.value) }
+        } else {
+            None
+        }
+    }
+
+    /// If the slot is occupied returns a mutable reference to its contents
+    /// otherwise returns None
+    pub fn get_mut(&mut self) -> Option<&mut T> {
+        if self.occupied() {
+            unsafe { Some(&mut self.u.value) }
+        } else {
+            None
+        }
+    }
+
+    fn get_slot_content(&self) -> SlotContent<T> {
         unsafe {
             if self.occupied() {
                 Occupied(&*self.u.value)
@@ -57,14 +71,18 @@ impl<T: Slottable> Slot<T> {
         }
     }
 
-    pub fn get_mut(&mut self) -> SlotContentMut<T> {
-        unsafe {
-            if self.occupied() {
-                OccupiedMut(&mut *self.u.value)
-            } else {
-                VacantMut(&mut self.u.next_free)
-            }
-        }
+    /// Returns a shared reference to the slot's contents
+    /// # Safety
+    /// Doesn't check if a slot is occupied or not
+    pub unsafe fn get_unchecked(&self) -> &T {
+        unsafe { &self.u.value }
+    }
+
+    /// Returns a mutable reference to the slot's contents
+    /// # Safety
+    /// Doesn't check if a slot is occupied or not
+    pub unsafe fn get_unchecked_mut(&mut self) -> &mut T {
+        unsafe { &mut self.u.value }
     }
 }
 
@@ -82,7 +100,7 @@ impl<T: Slottable> Drop for Slot<T> {
 impl<T: Clone + Slottable> Clone for Slot<T> {
     fn clone(&self) -> Self {
         Self {
-            u: match self.get() {
+            u: match self.get_slot_content() {
                 Occupied(value) => SlotUnion {
                     value: ManuallyDrop::new(value.clone()),
                 },
@@ -97,7 +115,7 @@ impl<T: fmt::Debug + Slottable> fmt::Debug for Slot<T> {
     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
         let mut builder = fmt.debug_struct("Slot");
         builder.field("version", &self.version);
-        match self.get() {
+        match self.get_slot_content() {
             Occupied(value) => builder.field("value", value).finish(),
             Vacant(next_free) => builder.field("next_free", next_free).finish(),
         }
@@ -389,10 +407,14 @@ impl<K: Key, V: Slottable> SlotMap<K, V> {
         key.into()
     }
 
-    // Helper function to remove a value from a slot. Safe iff the slot is
-    // occupied. Returns the value removed.
+    /// Removes a key from the slot map, returning the value at the key.
+    /// Assumes the slot was initialized and is occupied.
+    ///
+    /// # Safety
+    ///
+    /// If the above assumpition is not valid the behavior is undefined.
     #[inline(always)]
-    unsafe fn remove_from_slot(&mut self, idx: usize) -> V {
+    pub unsafe fn remove_from_slot(&mut self, idx: usize) -> V {
         // Remove value from slot before overwriting union.
         let slot = self.slots.get_unchecked_mut(idx);
         let value = ptr::read(&*slot.u.value);
@@ -464,7 +486,7 @@ impl<K: Key, V: Slottable> SlotMap<K, V> {
                 // This is safe because removing elements does not shrink slots.
                 let slot = unsafe { self.slots.get_unchecked_mut(i) };
                 let version = slot.version;
-                if let OccupiedMut(value) = slot.get_mut() {
+                if let Some(value) = slot.get_mut() {
                     let key = KeyData::new(i as u32, version).into();
                     !f(key, value)
                 } else {
@@ -749,6 +771,37 @@ impl<K: Key, V: Slottable> SlotMap<K, V> {
             inner: self.iter_mut(),
         }
     }
+
+    /// Returns the number of initialized slots in the map
+    pub fn slots_len(&self) -> usize {
+        self.slots.len()
+    }
+
+    /// Returns a shared reference to the slot given its index or None if index is invalid.
+    pub fn get_slot(&self, index: usize) -> Option<&Slot<V>> {
+        self.slots.get(index)
+    }
+
+    /// Returns a shared reference to the slot given its index.
+    /// Assumes the index does not exceed the value returned by `SlotMap::slots_len()`.
+    /// # Safety
+    /// If the index is not valid the behavior is undefined.
+    pub unsafe fn get_slot_unchecked(&self, index: usize) -> &Slot<V> {
+        self.slots.get_unchecked(index)
+    }
+
+    /// Returns a mutable reference to the slot given its index.
+    pub fn get_slot_mut(&mut self, index: usize) -> Option<&mut Slot<V>> {
+        self.slots.get_mut(index)
+    }
+
+    /// Returns a mutable reference to a slot given its index.
+    /// Assumes the index does not exceed the value returned by `SlotMap::slots_len()`.
+    /// # Safety
+    /// If the index is not valid the behavior is undefined.
+    pub unsafe fn get_slot_unchecked_mut(&mut self, index: usize) -> &mut Slot<V> {
+        self.slots.get_unchecked_mut(index)
+    }
 }
 
 impl<K: Key, V: Slottable> Default for SlotMap<K, V> {
@@ -891,7 +944,7 @@ impl<'a, K: Key, V: Slottable> Iterator for Iter<'a, K, V> {
 
     fn next(&mut self) -> Option<(K, &'a V)> {
         while let Some((idx, slot)) = self.slots.next() {
-            if let Occupied(value) = slot.get() {
+            if let Some(value) = slot.get() {
                 let key = KeyData::new(idx as u32, slot.version);
                 self.num_left -= 1;
                 return Some((key.into(), value));
@@ -912,7 +965,7 @@ impl<'a, K: Key, V: Slottable> Iterator for IterMut<'a, K, V> {
     fn next(&mut self) -> Option<(K, &'a mut V)> {
         while let Some((idx, slot)) = self.slots.next() {
             let version = slot.version;
-            if let OccupiedMut(value) = slot.get_mut() {
+            if let Some(value) = slot.get_mut() {
                 let key = KeyData::new(idx as u32, version);
                 self.num_left -= 1;
                 return Some((key.into(), value));
